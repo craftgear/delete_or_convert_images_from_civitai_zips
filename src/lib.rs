@@ -178,11 +178,7 @@ fn process_zip(
     )?;
     if deletions.is_empty() {
         if let Some(ref b) = read_bar {
-            // WHY: 1本のバーを使い回すため
-            b.set_length(1);
-            b.set_position(1);
-            b.set_message(color_msg("writing (skipped)", "90"));
-            b.finish_with_message(color_msg("done", "32"));
+            finalize_no_deletions(b, entries.len() as u64);
         }
         set_file_times(path, atime, mtime)?;
         return Ok(());
@@ -775,6 +771,13 @@ fn maybe_insert_model_safe(target: &mut HashSet<String>, name: &str) {
     }
 }
 
+fn finalize_no_deletions(bar: &ProgressBar, scanned_len: u64) {
+    bar.set_length(scanned_len.max(1));
+    bar.set_position(scanned_len);
+    bar.set_message(color_msg("scanned (no changes)", "90"));
+    bar.finish_with_message(color_msg("done", "32"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,6 +1114,15 @@ mod tests {
 
         assert!(cache_hit(&cache, "cat", &zip_path, &zip_hash(&zip_path, &meta)));
         assert!(!cache_hit(&cache, "dog", &zip_path, &zip_hash(&zip_path, &meta)));
+    }
+
+    #[test]
+    fn finalize_no_deletions_keeps_length() {
+        let bar = ProgressBar::new(5);
+        bar.set_position(0);
+        finalize_no_deletions(&bar, 5);
+        assert_eq!(bar.length(), Some(5));
+        assert_eq!(bar.position(), 5);
     }
 
     fn make_png_with_prompt(prompt: &str) -> Vec<u8> {
