@@ -91,6 +91,7 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::Interrupted);
         }
+        warn_if_path_long(path);
         let meta = io_ctx(path, fs::metadata(path))?;
         let zip_hash = zip_hash(path, &meta);
         if cache_hit(&cache, &keyword_key, path, &zip_hash) {
@@ -800,6 +801,31 @@ fn set_times(path: &Path, atime: FileTime, mtime: FileTime) -> Result<(), AppErr
     })
 }
 
+fn path_len_warning(path: &Path) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let len = path.as_os_str().len();
+    const MAX_PATH: usize = 260;
+    const WARN_AT: usize = 248; // WHY: WindowsのMAX_PATHに近い値で早めに知らせる
+    if len >= WARN_AT {
+        Some(format!(
+            "Warning: path length {} is near Windows MAX_PATH ({}): {}",
+            len,
+            MAX_PATH,
+            path.display()
+        ))
+    } else {
+        None
+    }
+}
+
+fn warn_if_path_long(path: &Path) {
+    if let Some(msg) = path_len_warning(path) {
+        eprintln!("{}", msg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,6 +1171,20 @@ mod tests {
         finalize_no_deletions(&bar, 5);
         assert_eq!(bar.length(), Some(5));
         assert_eq!(bar.position(), 5);
+    }
+
+    #[test]
+    fn path_len_warning_returns_none_for_short_path() {
+        assert!(path_len_warning(Path::new("C:\\short.zip")).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_len_warning_warns_when_long() {
+        let long_name = "C:\\".to_string() + &"a".repeat(250) + ".zip";
+        let p = Path::new(&long_name);
+        let msg = path_len_warning(p).expect("should warn");
+        assert!(msg.contains("MAX_PATH"));
     }
 
     fn make_png_with_prompt(prompt: &str) -> Vec<u8> {

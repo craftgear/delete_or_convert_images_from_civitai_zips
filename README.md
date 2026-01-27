@@ -13,17 +13,18 @@ CLI tool that scans ZIP files under a directory and deletes image and JSON entri
 ## Requirements
 - Rust stable
 
+## Install 
+
+Windows binary can be downloaded from the [ GitHub Releases page ](https://github.com/craftgear/delete_images_from_civitai_zips/releases).
+
 ## Build
 ```bash
 cargo build --release
 ```
 
-The binary will be at `target/release/delete_images_from_zips`.
-Windows binary can be downloaded from the GitHub Releases page.
-
 ## Usage
 ```bash
-delete_images_from_zips /path/to/zips --keywords cat,dog
+delete_images_from_zips /path/to/zips --keywords "cat,dog"
 ```
 
 ### Options
