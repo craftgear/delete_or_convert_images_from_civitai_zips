@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -29,3 +32,15 @@ jobs:
         with:
           name: delete_images_from_zips-windows
           path: target/release/delete_images_from_zips.exe
+
+      - name: Set release tag
+        if: github.event_name == 'push'
+        run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $env:GITHUB_ENV
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.SHORT_SHA }}
+          name: Auto release ${{ env.SHORT_SHA }}
+          files: target/release/delete_images_from_zips.exe
