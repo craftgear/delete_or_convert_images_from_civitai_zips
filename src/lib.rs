@@ -22,6 +22,11 @@ use tempfile::Builder;
 pub enum AppError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("IO error at \u{1b}[91m{path}\u{1b}[0m: {source}")]
+    IoWithPath {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("Zip error: {0}")]
     Zip(#[from] zip::result::ZipError),
     #[error("Zip error at \u{1b}[91m{path}\u{1b}[0m: {source}")]
@@ -86,7 +91,7 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::Interrupted);
         }
-        let meta = fs::metadata(path)?;
+        let meta = io_ctx(path, fs::metadata(path))?;
         let zip_hash = zip_hash(path, &meta);
         if cache_hit(&cache, &keyword_key, path, &zip_hash) {
             if progress {
@@ -118,14 +123,14 @@ fn process_zip(
     progress: bool,
     cancel: &AtomicBool,
 ) -> Result<(), AppError> {
-    let meta = fs::metadata(path)?;
+    let meta = io_ctx(path, fs::metadata(path))?;
     let atime = FileTime::from_last_access_time(&meta);
     let mtime = FileTime::from_last_modification_time(&meta);
     let dir_times = dir_times(path);
 
     // 読み取りフェーズ
     let (entries, read_bar) = {
-        let file = File::open(path)?;
+        let file = io_ctx(path, File::open(path))?;
         let mut archive = ZipArchive::new(file)
             .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
         let _total = archive.len() as u64;
@@ -180,7 +185,7 @@ fn process_zip(
         if let Some(ref b) = read_bar {
             finalize_no_deletions(b, entries.len() as u64);
         }
-        set_file_times(path, atime, mtime)?;
+    set_times(path, atime, mtime)?;
         return Ok(());
     }
     if let Some(ref b) = read_bar {
@@ -202,11 +207,11 @@ fn process_zip(
 
     if !deletions.is_empty() {
         // WHY: 書き換えが発生したときだけ元の時刻を復元して変更検知を抑制
-        set_file_times(path, atime, mtime)?;
+        set_times(path, atime, mtime)?;
     }
     if let Some((dir_path, dir_atime, dir_mtime)) = dir_times {
         // WHY: tmp作成やrenameで更新されたディレクトリ日時を元に戻す
-        let _ = set_file_times(&dir_path, dir_atime, dir_mtime);
+        let _ = set_times(&dir_path, dir_atime, dir_mtime);
     }
     Ok(())
 }
@@ -227,7 +232,7 @@ fn write_filtered_zip(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
 
-    let orig_permissions = fs::metadata(path)?.permissions();
+    let orig_permissions = io_ctx(path, fs::metadata(path))?.permissions();
 
     let mut tmp = Builder::new()
         .prefix("civitai_tmp")
@@ -235,7 +240,7 @@ fn write_filtered_zip(
         .tempfile_in(dir)?;
 
     // WHY: 一時ファイルの作成日時を元ZIPに合わせ、後工程でのタイムスタンプ差異を減らす
-    set_file_times(tmp.path(), atime, mtime)?;
+    set_times(tmp.path(), atime, mtime)?;
 
     {
         let buf_size = env::var("BUF_MB")
@@ -252,7 +257,7 @@ fn write_filtered_zip(
             b.tick(); // WHY: 0件書き込みでもバーを一度描画するため
         }
         // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
-        let mut src = ZipArchive::new(File::open(path)?)
+        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
             .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
@@ -282,15 +287,18 @@ fn write_filtered_zip(
     }
 
     // WHY: 書き込み後のfsyncコストを避けるため、renameベースで差し替える
-    fs::set_permissions(tmp.path(), orig_permissions.clone())?;
+    io_ctx(tmp.path(), fs::set_permissions(tmp.path(), orig_permissions.clone()))?;
 
     if path.exists() {
         // WHY: Windows上書き問題回避
-        fs::remove_file(path)?;
+        io_ctx(path, fs::remove_file(path))?;
     }
     let persist_result = tmp.persist(path);
     if let Err(err) = persist_result {
-        return Err(AppError::Io(err.error));
+        return Err(AppError::IoWithPath {
+            path: path.display().to_string(),
+            source: err.error,
+        });
     }
 
     if let Some(b) = bar {
@@ -339,7 +347,7 @@ fn decide_deletions(
 
     let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     if json_count > 0 {
-        let mut src = ZipArchive::new(File::open(path)?)
+        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
             .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
@@ -396,7 +404,7 @@ fn decide_deletions(
     let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     if !image_names.is_empty() {
         let image_name_set: HashSet<String> = image_names.into_iter().collect();
-        let mut src = ZipArchive::new(File::open(path)?)
+        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
             .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
@@ -709,10 +717,10 @@ fn load_cache(path: &std::path::Path) -> CacheMap {
 
 fn save_cache(path: &std::path::Path, cache: &CacheMap) -> Result<(), AppError> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        io_ctx(dir, fs::create_dir_all(dir))?;
     }
     let data = serde_json::to_string(cache)?;
-    fs::write(path, data)?;
+    io_ctx(path, fs::write(path, data))?;
     Ok(())
 }
 
@@ -776,6 +784,20 @@ fn finalize_no_deletions(bar: &ProgressBar, scanned_len: u64) {
     bar.set_position(scanned_len);
     bar.set_message(color_msg("scanned (no changes)", "90"));
     bar.finish_with_message(color_msg("done", "32"));
+}
+
+fn io_ctx<T>(path: &Path, res: std::io::Result<T>) -> Result<T, AppError> {
+    res.map_err(|e| AppError::IoWithPath {
+        path: path.display().to_string(),
+        source: e,
+    })
+}
+
+fn set_times(path: &Path, atime: FileTime, mtime: FileTime) -> Result<(), AppError> {
+    set_file_times(path, atime, mtime).map_err(|e| AppError::IoWithPath {
+        path: path.display().to_string(),
+        source: e,
+    })
 }
 
 #[cfg(test)]
