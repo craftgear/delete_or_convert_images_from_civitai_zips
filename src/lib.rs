@@ -156,15 +156,15 @@ fn process_zip(
     let mtime = FileTime::from_last_modification_time(&meta);
     let dir_times = dir_times(path);
 
-    // 走査と解析を1パスで行う
-    let (entries, deletions) = {
+    // 読み取りフェーズ
+    let (entries, scan_bar) = {
         let file = io_ctx(path, File::open(path))?;
         let mut archive = ZipArchive::new(file)
             .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
-        let total = archive.len() as u64;
+        let _total = archive.len() as u64;
 
         let scan_bar = if progress {
-            let b = ProgressBar::new(total.max(1));
+            let b = ProgressBar::new(_total.max(1));
             // WHY: 進捗の視認性を優先
             b.set_style(
                 ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
@@ -180,12 +180,8 @@ fn process_zip(
         };
 
         let mut list = Vec::new();
-        let mut stem_to_entries: HashMap<String, Vec<String>> = HashMap::new();
-        let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
-        let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
-
         for i in 0..archive.len() {
-            let mut file = archive
+            let file = archive
                 .by_index(i)
                 .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
             if file.name().ends_with('/') {
@@ -194,45 +190,41 @@ fn process_zip(
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
-            let meta = entry_meta_from_name(file.name())?;
-            stem_to_entries
-                .entry(meta.stem.clone())
-                .or_default()
-                .push(meta.name.clone());
-
-            match meta.kind {
-                EntryKind::Json => {
-                    let prompt = json_prompt_tags_from_reader(&mut file)?;
-                    json_prompts.insert(meta.stem.clone(), prompt);
-                }
-                EntryKind::Png => {
-                    let prompt = png_prompt_tags(&read_zipfile_bytes(&mut file)?);
-                    image_prompts.insert(meta.stem.clone(), prompt);
-                }
-                EntryKind::Webp => {
-                    let prompt = webp_prompt_tags(&read_zipfile_bytes(&mut file)?);
-                    image_prompts.insert(meta.stem.clone(), prompt);
-                }
-                EntryKind::Other => {}
-            }
-            list.push(meta);
+            list.push(entry_meta_from_name(file.name())?);
             if let Some(ref b) = scan_bar {
                 b.inc(1);
             }
         }
-
-        if let Some(ref b) = scan_bar {
-            b.finish_with_message(color_msg("scan done", "36"));
-        }
-
-        let deletions = decide_deletions_from_maps(
-            &stem_to_entries,
-            &json_prompts,
-            &image_prompts,
-            keywords,
-        );
-        (list, deletions)
+        (list, scan_bar)
     };
+
+    if let Some(ref b) = scan_bar {
+        b.finish_with_message(color_msg("scan done", "36"));
+    }
+
+    let json_count = count_json_entries(&entries);
+    let analyze_bar = if progress && json_count > 0 {
+        let b = ProgressBar::new(json_count.max(1));
+        b.set_style(
+            ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        let name = file_display_name(path);
+        b.set_prefix(color_msg(&name, "1;37"));
+        b.set_message(color_msg("analyzing json", "36"));
+        Some(b)
+    } else {
+        None
+    };
+
+    let deletions = decide_deletions(
+        path,
+        &entries,
+        keywords,
+        analyze_bar.as_ref(),
+        cancel,
+    )?;
     if deletions.is_empty() {
         if progress {
             let name = file_display_name(path);
@@ -376,13 +368,126 @@ fn write_filtered_zip(
     Ok(())
 }
 
-fn decide_deletions_from_maps(
-    stem_to_entries: &HashMap<String, Vec<String>>,
-    json_prompts: &HashMap<String, Option<Vec<String>>>,
-    image_prompts: &HashMap<String, Option<Vec<String>>>,
+fn decide_deletions(
+    path: &Path,
+    entries: &[EntryMeta],
     keywords: &[String],
-) -> HashSet<String> {
+    bar: Option<&ProgressBar>,
+    cancel: &AtomicBool,
+) -> Result<HashSet<String>, AppError> {
     let mut deletions = HashSet::new();
+    let mut stem_to_entries: HashMap<String, Vec<String>> = HashMap::new();
+    let mut json_name_to_stem: HashMap<String, String> = HashMap::new();
+    let mut image_name_to_meta: HashMap<String, (String, EntryKind)> = HashMap::new();
+
+    for e in entries {
+        stem_to_entries
+            .entry(e.stem.clone())
+            .or_default()
+            .push(e.name.clone());
+        match e.kind {
+            EntryKind::Json => {
+                json_name_to_stem.insert(e.name.clone(), e.stem.clone());
+            }
+            EntryKind::Png | EntryKind::Webp => {
+                image_name_to_meta.insert(e.name.clone(), (e.stem.clone(), e.kind));
+            }
+            EntryKind::Other => {}
+        }
+    }
+
+    let json_count = json_name_to_stem.len() as u64;
+
+    let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    if json_count > 0 {
+        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
+            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        for i in 0..src.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            let mut file = src
+                .by_index(i)
+                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            if file.name().ends_with('/') {
+                continue;
+            }
+            let stem = match json_name_to_stem.get(file.name()) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let prompt = json_prompt_tags_from_reader(&mut file)?;
+            json_prompts.insert(stem, prompt);
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+        }
+    }
+
+    let mut needs_image_check: HashSet<String> = HashSet::new();
+    for (stem, prompt_opt) in json_prompts.iter() {
+        if prompt_opt.is_none() {
+            needs_image_check.insert(stem.clone());
+        }
+    }
+
+    let mut image_names: Vec<String> = Vec::new();
+    if !needs_image_check.is_empty() {
+        for (name, (stem, _kind)) in image_name_to_meta.iter() {
+            if needs_image_check.contains(stem) {
+                image_names.push(name.clone());
+            }
+        }
+    }
+
+    if let Some(b) = bar {
+        let new_len = json_count + image_names.len() as u64;
+        b.set_length(new_len.max(1));
+        if image_names.is_empty() {
+            b.set_message(color_msg("analyzing json", "36"));
+        } else {
+            b.set_message(color_msg("analyzing images", "36"));
+        }
+    }
+
+    let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    if !image_names.is_empty() {
+        let image_name_set: HashSet<String> = image_names.into_iter().collect();
+        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
+            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        for i in 0..src.len() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(AppError::Interrupted);
+            }
+            let mut file = src
+                .by_index(i)
+                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            if file.name().ends_with('/') {
+                continue;
+            }
+            if !image_name_set.contains(file.name()) {
+                continue;
+            }
+            let (stem, kind) = match image_name_to_meta.get(file.name()) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let prompt = match kind {
+                EntryKind::Png => png_prompt_tags(&read_zipfile_bytes(&mut file)?),
+                EntryKind::Webp => webp_prompt_tags(&read_zipfile_bytes(&mut file)?),
+                _ => None,
+            };
+            image_prompts.insert(stem, prompt);
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+        }
+    }
+
+    if let Some(b) = bar {
+        // WHY: 次の行に進ませないため表示行を消す
+        b.finish_and_clear();
+    }
 
     for (stem, prompt_opt) in json_prompts.iter() {
         match prompt_opt {
@@ -417,7 +522,7 @@ fn decide_deletions_from_maps(
         }
     }
 
-    deletions
+    Ok(deletions)
 }
 
 fn parse_keywords(csv: &str) -> Vec<String> {
@@ -729,6 +834,13 @@ fn maybe_insert_model_safe(target: &mut HashSet<String>, name: &str) {
     if !is_model_info(name) {
         target.insert(name.to_string());
     }
+}
+
+fn count_json_entries(entries: &[EntryMeta]) -> u64 {
+    entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Json))
+        .count() as u64
 }
 
 fn io_ctx<T>(path: &Path, res: std::io::Result<T>) -> Result<T, AppError> {
@@ -1123,6 +1235,28 @@ mod tests {
 
         assert!(cache_hit(&cache, "cat", &zip_path, &zip_hash(&zip_path, &meta)));
         assert!(!cache_hit(&cache, "dog", &zip_path, &zip_hash(&zip_path, &meta)));
+    }
+
+    #[test]
+    fn count_json_entries_counts_only_json() {
+        let entries = vec![
+            EntryMeta {
+                name: "a.json".to_string(),
+                stem: "a".to_string(),
+                kind: EntryKind::Json,
+            },
+            EntryMeta {
+                name: "b.png".to_string(),
+                stem: "b".to_string(),
+                kind: EntryKind::Png,
+            },
+            EntryMeta {
+                name: "c.json".to_string(),
+                stem: "c".to_string(),
+                kind: EntryKind::Json,
+            },
+        ];
+        assert_eq!(count_json_entries(&entries), 2);
     }
 
     #[test]
