@@ -112,9 +112,6 @@ pub fn run(root: &Path, keywords_csv: &str, progress: bool) -> Result<(), AppErr
             }
             continue;
         }
-        if progress {
-            eprintln!();
-        }
         match process_zip(path, &keywords, progress, &cancel) {
             Ok(_changed) => {}
             Err(e) => {
