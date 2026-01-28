@@ -160,13 +160,13 @@ fn process_zip(
     let dir_times = dir_times(path);
 
     // 読み取りフェーズ
-    let (entries, read_bar) = {
+    let (entries, scan_bar) = {
         let file = io_ctx(path, File::open(path))?;
         let mut archive = ZipArchive::new(file)
             .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
         let _total = archive.len() as u64;
 
-        let read_bar = if progress {
+        let scan_bar = if progress {
             let b = ProgressBar::new(_total.max(1));
             // WHY: 進捗の視認性を優先
             b.set_style(
@@ -194,40 +194,69 @@ fn process_zip(
                 return Err(AppError::Interrupted);
             }
             list.push(entry_meta_from_name(file.name())?);
-            if let Some(ref b) = read_bar {
+            if let Some(ref b) = scan_bar {
                 b.inc(1);
             }
         }
-        (list, read_bar)
+        (list, scan_bar)
+    };
+
+    if let Some(ref b) = scan_bar {
+        b.finish_with_message(color_msg("scan done", "36"));
+    }
+
+    let json_count = count_json_entries(&entries);
+    let analyze_bar = if progress && json_count > 0 {
+        let b = ProgressBar::new(json_count.max(1));
+        b.set_style(
+            ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        let name = file_display_name(path);
+        b.set_prefix(color_msg(&name, "1;37"));
+        b.set_message(color_msg("analyzing json", "36"));
+        Some(b)
+    } else {
+        None
     };
 
     let deletions = decide_deletions(
         path,
         &entries,
-        entries.len() as u64,
         keywords,
-        read_bar.as_ref(),
+        analyze_bar.as_ref(),
         cancel,
     )?;
     if deletions.is_empty() {
-        if let Some(ref b) = read_bar {
-            finalize_no_deletions(b, entries.len() as u64);
+        if progress {
+            let name = file_display_name(path);
+            eprintln!("{} {}", color_msg(&name, "1;37"), color_msg("no changes", "90"));
         }
-    set_times(path, atime, mtime)?;
+        set_times(path, atime, mtime)?;
         return Ok(false);
     }
-    if let Some(ref b) = read_bar {
+    let write_bar = if progress {
         let kept_len = entries.len() as u64 - deletions.len() as u64;
-        b.set_length(kept_len.max(1));
-        b.set_position(0);
+        let b = ProgressBar::new(kept_len.max(1));
+        b.set_style(
+            ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        let name = file_display_name(path);
+        b.set_prefix(color_msg(&name, "1;37"));
         b.set_message(color_msg("writing", "32"));
-    }
+        Some(b)
+    } else {
+        None
+    };
 
     write_filtered_zip(
         path,
         &entries,
         &deletions,
-        read_bar.as_ref(),
+        write_bar.as_ref(),
         cancel,
         atime,
         mtime,
@@ -345,7 +374,6 @@ fn write_filtered_zip(
 fn decide_deletions(
     path: &Path,
     entries: &[EntryMeta],
-    base_len: u64,
     keywords: &[String],
     bar: Option<&ProgressBar>,
     cancel: &AtomicBool,
@@ -416,16 +444,12 @@ fn decide_deletions(
     }
 
     if let Some(b) = bar {
-        let new_len = base_len + json_count + image_names.len() as u64;
+        let new_len = json_count + image_names.len() as u64;
         b.set_length(new_len.max(1));
-        b.set_style(
-            ProgressStyle::with_template("{prefix} [{wide_bar}] {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        if b.position() < base_len {
-            // WHY: 既存の読み取り進捗を維持するため
-            b.set_position(base_len);
+        if image_names.is_empty() {
+            b.set_message(color_msg("analyzing json", "36"));
+        } else {
+            b.set_message(color_msg("analyzing images", "36"));
         }
     }
 
@@ -464,8 +488,8 @@ fn decide_deletions(
     }
 
     if let Some(b) = bar {
-        // WHY: 後続の書き込みフェーズでも同じバーを使うため消さない
-        b.tick();
+        // WHY: 解析完了を明確に伝えるため
+        b.finish_with_message(color_msg("analysis done", "36"));
     }
 
     for (stem, prompt_opt) in json_prompts.iter() {
@@ -815,11 +839,11 @@ fn maybe_insert_model_safe(target: &mut HashSet<String>, name: &str) {
     }
 }
 
-fn finalize_no_deletions(bar: &ProgressBar, scanned_len: u64) {
-    bar.set_length(scanned_len.max(1));
-    bar.set_position(scanned_len);
-    bar.set_message(color_msg("scanned (no changes)", "90"));
-    bar.finish_with_message(color_msg("done", "32"));
+fn count_json_entries(entries: &[EntryMeta]) -> u64 {
+    entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::Json))
+        .count() as u64
 }
 
 fn io_ctx<T>(path: &Path, res: std::io::Result<T>) -> Result<T, AppError> {
@@ -1084,6 +1108,7 @@ mod tests {
 
     #[test]
     fn run_with_progress_bar_completes() {
+        let _guard = env_guard();
         let dir = tempdir().unwrap();
         let zip_path = dir.path().join("p.zip");
 
@@ -1216,12 +1241,25 @@ mod tests {
     }
 
     #[test]
-    fn finalize_no_deletions_keeps_length() {
-        let bar = ProgressBar::new(5);
-        bar.set_position(0);
-        finalize_no_deletions(&bar, 5);
-        assert_eq!(bar.length(), Some(5));
-        assert_eq!(bar.position(), 5);
+    fn count_json_entries_counts_only_json() {
+        let entries = vec![
+            EntryMeta {
+                name: "a.json".to_string(),
+                stem: "a".to_string(),
+                kind: EntryKind::Json,
+            },
+            EntryMeta {
+                name: "b.png".to_string(),
+                stem: "b".to_string(),
+                kind: EntryKind::Png,
+            },
+            EntryMeta {
+                name: "c.json".to_string(),
+                stem: "c".to_string(),
+                kind: EntryKind::Json,
+            },
+        ];
+        assert_eq!(count_json_entries(&entries), 2);
     }
 
     #[test]
