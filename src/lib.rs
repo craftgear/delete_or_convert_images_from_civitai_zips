@@ -199,7 +199,8 @@ fn process_zip(
     };
 
     if let Some(ref b) = scan_bar {
-        b.finish_with_message(color_msg("scan done", "36"));
+        // WHY: 次の解析表示で同じ行を使うため
+        b.finish_and_clear();
     }
 
     let json_count = count_json_entries(&entries);
