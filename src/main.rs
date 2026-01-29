@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use delete_images_from_zips::run;
+use delete_images_from_zips::{run, AppError, ConvertFormat};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -21,6 +21,10 @@ struct Cli {
     /// Clear cache file and exit
     #[arg(long)]
     clear_cache: bool,
+
+    /// Convert png to webp, jpg, jpg_gpu, or jxl after deletions
+    #[arg(long, value_enum)]
+    convert: Option<ConvertFormat>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,5 +41,12 @@ fn main() -> anyhow::Result<()> {
         .keywords
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--keywords is required unless --clear-cache"))?;
-    run(root, keywords, cli.progress).map_err(|e| anyhow::anyhow!(e))
+    match run(root, keywords, cli.progress, cli.convert) {
+        Ok(()) => Ok(()),
+        Err(AppError::Interrupted) => {
+            eprintln!("Interrupted");
+            std::process::exit(130);
+        }
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
 }
