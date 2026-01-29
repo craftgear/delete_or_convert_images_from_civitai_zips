@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -164,7 +164,8 @@ fn run_with_cancel(
     let cache_path = cache_file_path();
     let mut cache = load_cache(&cache_path);
     let mut errors: Vec<(std::path::PathBuf, AppError)> = Vec::new();
-    let zip_paths: Vec<_> = WalkDir::new(root)
+    let root_path = io_path(root);
+    let zip_paths: Vec<_> = WalkDir::new(&root_path)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -202,7 +203,7 @@ fn run_with_cancel(
             return Err(AppError::Interrupted);
         }
         warn_if_path_long(path);
-        let meta = match io_ctx(path, fs::metadata(path)) {
+        let meta = match io_ctx(path, fs::metadata(&io_path(path))) {
             Ok(m) => m,
             Err(e) => {
                 errors.push((path.clone(), e));
@@ -230,7 +231,7 @@ fn run_with_cancel(
                 }
             };
         let final_hash = if changed {
-            let meta_after = io_ctx(path, fs::metadata(path))?;
+            let meta_after = io_ctx(path, fs::metadata(&io_path(path)))?;
             zip_hash(path, &meta_after)
         } else {
             zip_hash_before
@@ -241,7 +242,7 @@ fn run_with_cancel(
     if !errors.is_empty() {
         eprintln!("{} {}", color_msg("Errors", "31"), errors.len());
         for (p, e) in errors.iter() {
-            eprintln!("- {}: {}", p.display(), e);
+            eprintln!("- {}: {}", display_path(p), e);
         }
         return Err(AppError::Invalid(format!(
             "{} file(s) failed; see log",
@@ -255,7 +256,7 @@ pub fn clear_cache_file() -> Result<(), AppError> {
     let path = cache_file_path();
     if path.exists() {
         // WHY: 利用者が即座に再試行できるようにキャッシュ削除を提供
-        io_ctx(&path, fs::remove_file(&path))?;
+        io_ctx(&path, fs::remove_file(&io_path(&path)))?;
     }
     Ok(())
 }
@@ -268,16 +269,16 @@ fn process_zip(
     cancel: &AtomicBool,
     convert: Option<ConvertFormat>,
 ) -> Result<bool, AppError> {
-    let meta = io_ctx(path, fs::metadata(path))?;
+    let meta = io_ctx(path, fs::metadata(&io_path(path)))?;
     let atime = FileTime::from_last_access_time(&meta);
     let mtime = FileTime::from_last_modification_time(&meta);
     let dir_times = dir_times(path);
 
     // 読み取りフェーズ
     let (entries, scan_bar) = {
-        let file = io_ctx(path, File::open(path))?;
+        let file = io_ctx(path, File::open(&io_path(path)))?;
         let mut archive = ZipArchive::new(file)
-            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
         let _total = archive.len() as u64;
 
         let scan_bar = if progress {
@@ -300,7 +301,7 @@ fn process_zip(
         for i in 0..archive.len() {
             let file = archive
                 .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -417,7 +418,7 @@ fn write_filtered_zip(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
 
-    let orig_permissions = io_ctx(path, fs::metadata(path))?.permissions();
+    let orig_permissions = io_ctx(path, fs::metadata(&io_path(path)))?.permissions();
     let prepared_conversions = match conversion_plan {
         Some(plan) => Some(prepare_conversions(
             path,
@@ -465,8 +466,8 @@ fn write_filtered_zip(
             b.tick(); // WHY: 0件書き込みでもバーを一度描画するため
         }
         // WHY: 再圧縮を避け、元の圧縮データをそのままコピーして速度を優先
-        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
-            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
         let convert_targets = conversion_plan.map(|p| &p.target_names);
         let entry_stems = build_entry_stems(entries);
         let entry_kinds = build_entry_kinds(entries);
@@ -479,7 +480,7 @@ fn write_filtered_zip(
             }
             let file = src
                 .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -540,16 +541,19 @@ fn write_filtered_zip(
     }
 
     // WHY: 書き込み後のfsyncコストを避けるため、renameベースで差し替える
-    io_ctx(tmp.path(), fs::set_permissions(tmp.path(), orig_permissions.clone()))?;
+    io_ctx(
+        tmp.path(),
+        fs::set_permissions(&io_path(tmp.path()), orig_permissions.clone()),
+    )?;
 
-    if path.exists() {
+    if io_path(path).exists() {
         // WHY: Windows上書き問題回避
-        io_ctx(path, fs::remove_file(path))?;
+        io_ctx(path, fs::remove_file(&io_path(path)))?;
     }
-    let persist_result = tmp.persist(path);
+    let persist_result = tmp.persist(&io_path(path));
     if let Err(err) = persist_result {
         return Err(AppError::IoWithPath {
-            path: path.display().to_string(),
+            path: display_path(path),
             source: err.error,
         });
     }
@@ -575,8 +579,8 @@ fn prepare_conversions(
     bar: Option<&ProgressBar>,
     progress_info: &ProgressInfo,
 ) -> Result<PreparedConversions, AppError> {
-    let mut archive = ZipArchive::new(io_ctx(path, File::open(path))?)
-        .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+    let mut archive = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+        .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
     let mut inputs = Vec::new();
     for i in 0..archive.len() {
         if cancel.load(Ordering::Relaxed) {
@@ -584,7 +588,7 @@ fn prepare_conversions(
         }
         let mut file = archive
             .by_index(i)
-            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
         if file.name().ends_with('/') {
             continue;
         }
@@ -779,15 +783,15 @@ fn decide_deletions(
 
     let mut json_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     if json_count > 0 {
-        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
-            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
             let mut file = src
                 .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -830,15 +834,15 @@ fn decide_deletions(
     let mut image_prompts: HashMap<String, Option<Vec<String>>> = HashMap::new();
     if !image_names.is_empty() {
         let image_name_set: HashSet<String> = image_names.into_iter().collect();
-        let mut src = ZipArchive::new(io_ctx(path, File::open(path))?)
-            .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+        let mut src = ZipArchive::new(io_ctx(path, File::open(&io_path(path)))?)
+            .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
         for i in 0..src.len() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(AppError::Interrupted);
             }
             let mut file = src
                 .by_index(i)
-                .map_err(|e| AppError::ZipWithPath { path: path.display().to_string(), source: e })?;
+                .map_err(|e| AppError::ZipWithPath { path: display_path(path), source: e })?;
             if file.name().ends_with('/') {
                 continue;
             }
@@ -917,7 +921,7 @@ fn parse_keywords(csv: &str) -> Vec<String> {
 fn file_display_name(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
+        .unwrap_or_else(|| display_path(path))
 }
 
 fn progress_prefix(info: &ProgressInfo, offset: usize) -> String {
@@ -1453,7 +1457,7 @@ fn warn_skip_pngs(path: &Path, skips: &[ConversionSkip]) {
         eprintln!(
             "{} {}: {}: {}",
             color_msg("skipped", "33"),
-            path.display(),
+            display_path(path),
             skip.name,
             skip.error
         );
@@ -1821,7 +1825,7 @@ fn cache_file_path() -> std::path::PathBuf {
 }
 
 fn load_cache(path: &std::path::Path) -> CacheMap {
-    let data = match fs::read_to_string(path) {
+    let data = match fs::read_to_string(&io_path(path)) {
         Ok(v) => v,
         Err(_) => return HashMap::new(),
     };
@@ -1830,17 +1834,17 @@ fn load_cache(path: &std::path::Path) -> CacheMap {
 
 fn save_cache(path: &std::path::Path, cache: &CacheMap) -> Result<(), AppError> {
     if let Some(dir) = path.parent() {
-        io_ctx(dir, fs::create_dir_all(dir))?;
+        io_ctx(dir, fs::create_dir_all(&io_path(dir)))?;
     }
     let data = serde_json::to_string(cache)?;
-    io_ctx(path, fs::write(path, data))?;
+    io_ctx(path, fs::write(&io_path(path), data))?;
     Ok(())
 }
 
 fn cache_hit(cache: &CacheMap, keyword: &str, path: &Path, hash: &str) -> bool {
     cache
         .get(keyword)
-        .and_then(|m| m.get(&path.display().to_string()))
+        .and_then(|m| m.get(&display_path(path)))
         .map(|v| v == hash)
         .unwrap_or(false)
 }
@@ -1849,13 +1853,13 @@ fn cache_insert(cache: &mut CacheMap, keyword: &str, path: &Path, hash: String) 
     cache
         .entry(keyword.to_string())
         .or_default()
-        .insert(path.display().to_string(), hash);
+        .insert(display_path(path), hash);
 }
 
 fn zip_hash(path: &Path, meta: &fs::Metadata) -> String {
     let mtime = FileTime::from_last_modification_time(meta);
     let mut hasher = Sha256::new();
-    hasher.update(path.display().to_string().as_bytes());
+    hasher.update(display_path(path).as_bytes());
     hasher.update(mtime.unix_seconds().to_le_bytes());
     hasher.update(mtime.nanoseconds().to_le_bytes());
     hasher.update(meta.len().to_le_bytes());
@@ -1873,7 +1877,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 fn dir_times(path: &Path) -> Option<(std::path::PathBuf, FileTime, FileTime)> {
     let dir = path.parent()?;
-    let meta = fs::metadata(dir).ok()?;
+    let meta = fs::metadata(&io_path(dir)).ok()?;
     let atime = FileTime::from_last_access_time(&meta);
     let mtime = FileTime::from_last_modification_time(&meta);
     Some((dir.to_path_buf(), atime, mtime))
@@ -1899,16 +1903,97 @@ fn count_json_entries(entries: &[EntryMeta]) -> u64 {
         .count() as u64
 }
 
+#[cfg(windows)]
+fn io_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with(r"\\?\") || path_str.starts_with(r"\\.\") {
+        return path.to_path_buf();
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let normalized = normalize_windows_path(&absolute);
+    let normalized_str = normalized.to_string_lossy();
+    if let Some(stripped) = normalized_str.strip_prefix(r"\\") {
+        return PathBuf::from(format!(r"\\?\UNC\{}", stripped));
+    }
+    PathBuf::from(format!(r"\\?\{}", normalized_str))
+}
+
+#[cfg(not(windows))]
+fn io_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn normalize_windows_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut prefix: Option<String> = None;
+    let mut has_root = false;
+    let mut parts: Vec<String> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => prefix = Some(p.as_os_str().to_string_lossy().to_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = parts.pop();
+            }
+            Component::Normal(s) => parts.push(s.to_string_lossy().to_string()),
+        }
+    }
+
+    let mut out = String::new();
+    if let Some(prefix) = prefix {
+        out.push_str(&prefix);
+    }
+    if has_root && !out.ends_with('\\') {
+        out.push('\\');
+    }
+    for part in parts {
+        if !out.ends_with('\\') {
+            out.push('\\');
+        }
+        out.push_str(&part);
+    }
+    PathBuf::from(out)
+}
+
+#[cfg(windows)]
+fn display_path(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", stripped);
+    }
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        return stripped.to_string();
+    }
+    if let Some(stripped) = path_str.strip_prefix(r"\\.\") {
+        return stripped.to_string();
+    }
+    path_str.to_string()
+}
+
+#[cfg(not(windows))]
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
 fn io_ctx<T>(path: &Path, res: std::io::Result<T>) -> Result<T, AppError> {
     res.map_err(|e| AppError::IoWithPath {
-        path: path.display().to_string(),
+        path: display_path(path),
         source: e,
     })
 }
 
 fn set_times(path: &Path, atime: FileTime, mtime: FileTime) -> Result<(), AppError> {
-    set_file_times(path, atime, mtime).map_err(|e| AppError::IoWithPath {
-        path: path.display().to_string(),
+    set_file_times(&io_path(path), atime, mtime).map_err(|e| AppError::IoWithPath {
+        path: display_path(path),
         source: e,
     })
 }
@@ -1939,22 +2024,9 @@ fn init_rayon_threads(threads: usize) -> Result<(), AppError> {
 }
 
 fn path_len_warning(path: &Path) -> Option<String> {
-    if !cfg!(windows) {
-        return None;
-    }
-    let len = path.as_os_str().len();
-    const MAX_PATH: usize = 260;
-    const WARN_AT: usize = 248; // WHY: WindowsのMAX_PATHに近い値で早めに知らせる
-    if len >= WARN_AT {
-        Some(format!(
-            "Warning: path length {} is near Windows MAX_PATH ({}): {}",
-            len,
-            MAX_PATH,
-            path.display()
-        ))
-    } else {
-        None
-    }
+    let _ = path;
+    // WHY: パス長警告は出さない方針に変更した
+    None
 }
 
 fn warn_if_path_long(path: &Path) {
@@ -2153,6 +2225,15 @@ mod tests {
         let jpg_bytes = read_zipfile_bytes(&mut jpg).unwrap();
         assert_ne!(jpg_bytes, vec![1, 2, 3, 4]);
         assert!(jpg_bytes.len() > 4);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn converts_png_to_jpg_gpu_on_windows() {
+        let png = make_png_with_text_chunks(&[("prompt", "cat")]);
+        let jpg = convert_png_bytes_basic(&png, ConvertFormat::JpegGpu).unwrap();
+        assert!(jpg.len() > 3);
+        assert!(jpg.as_slice().starts_with(&[0xFF, 0xD8, 0xFF]));
     }
 
     #[test]
@@ -2951,11 +3032,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn path_len_warning_warns_when_long() {
+    fn path_len_warning_returns_none_for_long_path() {
         let long_name = "C:\\".to_string() + &"a".repeat(250) + ".zip";
         let p = Path::new(&long_name);
-        let msg = path_len_warning(p).expect("should warn");
-        assert!(msg.contains("MAX_PATH"));
+        assert!(path_len_warning(p).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn io_path_adds_verbatim_prefix_for_absolute() {
+        let path = Path::new(r"C:\temp\sample.zip");
+        let long = io_path(path);
+        let long_str = long.to_string_lossy();
+        assert!(long_str.starts_with(r"\\?\"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_strips_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\temp\sample.zip");
+        assert_eq!(display_path(path), r"C:\temp\sample.zip");
     }
 
     fn exif_user_comment_map(exif_data: &[u8]) -> serde_json::Value {

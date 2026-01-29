@@ -52,12 +52,13 @@ Cache file location:
 
 ## Environment variables
 - `BUF_MB` Set write buffer size in MB, default is 16
-- `NVJPEG_LIB` (Linux) Path to `libnvjpeg.so` or a directory that contains it
+- `NVJPEG_LIB` (Linux, Windows) Path to `libnvjpeg.so` or `nvjpeg64_*.dll`, or a directory that contains it
 
 ## GPU encoding
 - `jpg_gpu` requires hardware acceleration
 - Linux uses nvJPEG and errors if `libnvjpeg.so` is not available or GPU is unavailable
 - macOS uses VideoToolbox and errors if hardware encode is unavailable
+- Windows uses nvJPEG and falls back to CPU if the library or GPU is unavailable
 
 ## Examples
 ```bash

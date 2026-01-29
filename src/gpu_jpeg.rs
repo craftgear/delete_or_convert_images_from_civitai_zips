@@ -10,10 +10,14 @@ pub fn convert_png_to_jpeg_gpu(rgba: &RgbaImage, quality: u8) -> Result<Vec<u8>,
     {
         return macos::convert_png_to_jpeg_gpu(rgba, quality);
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        return windows::convert_png_to_jpeg_gpu(rgba, quality);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         Err(AppError::Invalid(
-            "jpg_gpu is supported only on Linux or macOS".to_string(),
+            "jpg_gpu is supported only on Linux, macOS, or Windows".to_string(),
         ))
     }
 }
@@ -583,5 +587,387 @@ mod macos {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::env;
+    use std::path::PathBuf;
+    use std::ptr;
+
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, RgbaImage};
+    use libloading::Library;
+
+    use crate::ffi::nvjpeg_bindings::{
+        cudaStream_t, nvjpegEncoderParams_t, nvjpegEncoderState_t, nvjpegHandle_t, nvjpegImage_t,
+        nvjpegInputFormat_t, nvjpegStatus_t, NVJPEG_INPUT_RGBI, NVJPEG_STATUS_SUCCESS,
+    };
+    use crate::AppError;
+
+    const NVJPEG_DLL_CANDIDATES: [&str; 2] = ["nvjpeg64_12.dll", "nvjpeg64_11.dll"];
+
+    pub(super) fn convert_png_to_jpeg_gpu(
+        rgba: &RgbaImage,
+        quality: u8,
+    ) -> Result<Vec<u8>, AppError> {
+        match convert_png_to_jpeg_nvjpeg(rgba, quality) {
+            Ok(out) => Ok(out),
+            Err(nvjpeg_err) => {
+                // WHY: Windows は GPU 利用に失敗した場合に CPU へフォールバックする
+                let cpu_result = convert_png_to_jpeg_cpu(rgba, quality);
+                match cpu_result {
+                    Ok(out) => Ok(out),
+                    Err(cpu_err) => Err(AppError::Invalid(format!(
+                        "nvjpeg failed: {}; cpu fallback failed: {}",
+                        nvjpeg_err, cpu_err
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn convert_png_to_jpeg_cpu(rgba: &RgbaImage, quality: u8) -> Result<Vec<u8>, AppError> {
+        let width = rgba.width();
+        let height = rgba.height();
+        if width == 0 || height == 0 {
+            return Err(AppError::Invalid("Invalid image size".to_string()));
+        }
+
+        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for chunk in rgba.as_raw().chunks_exact(4) {
+            rgb.push(chunk[0]);
+            rgb.push(chunk[1]);
+            rgb.push(chunk[2]);
+        }
+
+        let mut out = Vec::new();
+        let quality = quality.clamp(1, 100);
+        let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
+        encoder.encode(&rgb, width, height, ExtendedColorType::Rgb8)?;
+        Ok(out)
+    }
+
+    fn convert_png_to_jpeg_nvjpeg(
+        rgba: &RgbaImage,
+        quality: u8,
+    ) -> Result<Vec<u8>, AppError> {
+        let nvjpeg = NvJpeg::load()?;
+        let mut ctx = NvJpegContext::new(&nvjpeg.fns);
+        let stream: cudaStream_t = ptr::null_mut();
+
+        unsafe {
+            check_status(
+                (nvjpeg.fns.create_simple)(&mut ctx.handle),
+                "create handle",
+            )?;
+            check_status(
+                (nvjpeg.fns.encoder_state_create)(ctx.handle, &mut ctx.state, stream),
+                "create encoder state",
+            )?;
+            check_status(
+                (nvjpeg.fns.encoder_params_create)(ctx.handle, &mut ctx.params, stream),
+                "create encoder params",
+            )?;
+            let quality = quality.clamp(1, 100) as i32;
+            check_status(
+                (nvjpeg.fns.encoder_params_set_quality)(ctx.params, quality, stream),
+                "set quality",
+            )?;
+        }
+
+        let width = rgba.width() as i32;
+        let height = rgba.height() as i32;
+        if width <= 0 || height <= 0 {
+            return Err(AppError::Invalid("Invalid image size".to_string()));
+        }
+
+        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        for chunk in rgba.as_raw().chunks_exact(4) {
+            rgb.push(chunk[0]);
+            rgb.push(chunk[1]);
+            rgb.push(chunk[2]);
+        }
+
+        let mut image = nvjpegImage_t {
+            channel: [ptr::null_mut(); 4],
+            pitch: [0; 4],
+        };
+        image.channel[0] = rgb.as_mut_ptr();
+        image.pitch[0] = (width as usize * 3) as u32;
+
+        unsafe {
+            check_status(
+                (nvjpeg.fns.encode_image)(
+                    ctx.handle,
+                    ctx.state,
+                    ctx.params,
+                    &image,
+                    NVJPEG_INPUT_RGBI,
+                    width,
+                    height,
+                    stream,
+                ),
+                "encode image",
+            )?;
+        }
+
+        let mut length: usize = 0;
+        unsafe {
+            check_status(
+                (nvjpeg.fns.encode_retrieve)(ctx.handle, ctx.state, ptr::null_mut(), &mut length, stream),
+                "retrieve length",
+            )?;
+        }
+        if length == 0 {
+            return Err(AppError::Invalid("nvjpeg produced empty output".to_string()));
+        }
+
+        let mut out = vec![0u8; length];
+        unsafe {
+            check_status(
+                (nvjpeg.fns.encode_retrieve)(ctx.handle, ctx.state, out.as_mut_ptr(), &mut length, stream),
+                "retrieve bitstream",
+            )?;
+        }
+        out.truncate(length);
+        Ok(out)
+    }
+
+    type NvjpegCreateSimple = unsafe extern "C" fn(*mut nvjpegHandle_t) -> nvjpegStatus_t;
+    type NvjpegDestroy = unsafe extern "C" fn(nvjpegHandle_t) -> nvjpegStatus_t;
+    type NvjpegEncoderStateCreate =
+        unsafe extern "C" fn(nvjpegHandle_t, *mut nvjpegEncoderState_t, cudaStream_t)
+            -> nvjpegStatus_t;
+    type NvjpegEncoderStateDestroy = unsafe extern "C" fn(nvjpegEncoderState_t) -> nvjpegStatus_t;
+    type NvjpegEncoderParamsCreate =
+        unsafe extern "C" fn(nvjpegHandle_t, *mut nvjpegEncoderParams_t, cudaStream_t)
+            -> nvjpegStatus_t;
+    type NvjpegEncoderParamsDestroy =
+        unsafe extern "C" fn(nvjpegEncoderParams_t) -> nvjpegStatus_t;
+    type NvjpegEncoderParamsSetQuality =
+        unsafe extern "C" fn(nvjpegEncoderParams_t, i32, cudaStream_t) -> nvjpegStatus_t;
+    type NvjpegEncodeImage = unsafe extern "C" fn(
+        nvjpegHandle_t,
+        nvjpegEncoderState_t,
+        nvjpegEncoderParams_t,
+        *const nvjpegImage_t,
+        nvjpegInputFormat_t,
+        i32,
+        i32,
+        cudaStream_t,
+    ) -> nvjpegStatus_t;
+    type NvjpegEncodeRetrieveBitstream = unsafe extern "C" fn(
+        nvjpegHandle_t,
+        nvjpegEncoderState_t,
+        *mut u8,
+        *mut usize,
+        cudaStream_t,
+    ) -> nvjpegStatus_t;
+
+    struct NvJpegFns {
+        create_simple: NvjpegCreateSimple,
+        destroy: NvjpegDestroy,
+        encoder_state_create: NvjpegEncoderStateCreate,
+        encoder_state_destroy: NvjpegEncoderStateDestroy,
+        encoder_params_create: NvjpegEncoderParamsCreate,
+        encoder_params_destroy: NvjpegEncoderParamsDestroy,
+        encoder_params_set_quality: NvjpegEncoderParamsSetQuality,
+        encode_image: NvjpegEncodeImage,
+        encode_retrieve: NvjpegEncodeRetrieveBitstream,
+    }
+
+    impl NvJpegFns {
+        unsafe fn load(lib: &Library) -> Result<Self, AppError> {
+            unsafe {
+                Ok(Self {
+                    create_simple: *lib
+                        .get(b"nvjpegCreateSimple\0")
+                        .map_err(|e| AppError::Invalid(format!("nvjpegCreateSimple: {}", e)))?,
+                    destroy: *lib
+                        .get(b"nvjpegDestroy\0")
+                        .map_err(|e| AppError::Invalid(format!("nvjpegDestroy: {}", e)))?,
+                    encoder_state_create: *lib
+                        .get(b"nvjpegEncoderStateCreate\0")
+                        .map_err(|e| {
+                            AppError::Invalid(format!("nvjpegEncoderStateCreate: {}", e))
+                        })?,
+                    encoder_state_destroy: *lib
+                        .get(b"nvjpegEncoderStateDestroy\0")
+                        .map_err(|e| {
+                            AppError::Invalid(format!("nvjpegEncoderStateDestroy: {}", e))
+                        })?,
+                    encoder_params_create: *lib
+                        .get(b"nvjpegEncoderParamsCreate\0")
+                        .map_err(|e| {
+                            AppError::Invalid(format!("nvjpegEncoderParamsCreate: {}", e))
+                        })?,
+                    encoder_params_destroy: *lib
+                        .get(b"nvjpegEncoderParamsDestroy\0")
+                        .map_err(|e| {
+                            AppError::Invalid(format!("nvjpegEncoderParamsDestroy: {}", e))
+                        })?,
+                    encoder_params_set_quality: *lib
+                        .get(b"nvjpegEncoderParamsSetQuality\0")
+                        .map_err(|e| {
+                            AppError::Invalid(format!("nvjpegEncoderParamsSetQuality: {}", e))
+                        })?,
+                    encode_image: *lib
+                        .get(b"nvjpegEncodeImage\0")
+                        .map_err(|e| AppError::Invalid(format!("nvjpegEncodeImage: {}", e)))?,
+                    encode_retrieve: *lib
+                        .get(b"nvjpegEncodeRetrieveBitstream\0")
+                        .map_err(|e| {
+                            AppError::Invalid(format!("nvjpegEncodeRetrieveBitstream: {}", e))
+                        })?,
+                })
+            }
+        }
+    }
+
+    struct NvJpeg {
+        _lib: Library,
+        fns: NvJpegFns,
+    }
+
+    impl NvJpeg {
+        fn load() -> Result<Self, AppError> {
+            let candidates = nvjpeg_library_candidates();
+            let mut last_err: Option<AppError> = None;
+            for candidate in candidates {
+                let lib = match unsafe { Library::new(&candidate) } {
+                    Ok(lib) => lib,
+                    Err(err) => {
+                        last_err = Some(AppError::Invalid(format!(
+                            "nvjpeg library load: {}: {}",
+                            candidate.display(),
+                            err
+                        )));
+                        continue;
+                    }
+                };
+                let fns = match unsafe { NvJpegFns::load(&lib) } {
+                    Ok(fns) => return Ok(Self { _lib: lib, fns }),
+                    Err(err) => {
+                        last_err = Some(err);
+                        continue;
+                    }
+                };
+            }
+            Err(last_err.unwrap_or_else(|| {
+                AppError::Invalid("nvjpeg library load: no candidates".to_string())
+            }))
+        }
+    }
+
+    struct NvJpegContext<'a> {
+        fns: &'a NvJpegFns,
+        handle: nvjpegHandle_t,
+        state: nvjpegEncoderState_t,
+        params: nvjpegEncoderParams_t,
+    }
+
+    impl<'a> NvJpegContext<'a> {
+        fn new(fns: &'a NvJpegFns) -> Self {
+            Self {
+                fns,
+                handle: ptr::null_mut(),
+                state: ptr::null_mut(),
+                params: ptr::null_mut(),
+            }
+        }
+    }
+
+    impl Drop for NvJpegContext<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.params.is_null() {
+                    let _ = (self.fns.encoder_params_destroy)(self.params);
+                }
+                if !self.state.is_null() {
+                    let _ = (self.fns.encoder_state_destroy)(self.state);
+                }
+                if !self.handle.is_null() {
+                    let _ = (self.fns.destroy)(self.handle);
+                }
+            }
+        }
+    }
+
+    fn nvjpeg_library_candidates() -> Vec<PathBuf> {
+        if let Ok(value) = env::var("NVJPEG_LIB") {
+            let path = PathBuf::from(value);
+            if path.is_dir() {
+                return NVJPEG_DLL_CANDIDATES
+                    .iter()
+                    .map(|name| path.join(name))
+                    .collect();
+            }
+            return vec![path];
+        }
+        NVJPEG_DLL_CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    fn check_status(status: nvjpegStatus_t, context: &str) -> Result<(), AppError> {
+        if status == NVJPEG_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(AppError::Invalid(format!(
+                "nvjpeg {} failed: {}",
+                context, status
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Mutex, OnceLock};
+        use tempfile::tempdir;
+
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+        fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+            ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
+        fn restore_env(previous: Option<String>) {
+            if let Some(value) = previous {
+                env::set_var("NVJPEG_LIB", value);
+            } else {
+                env::remove_var("NVJPEG_LIB");
+            }
+        }
+
+        #[test]
+        fn nvjpeg_library_candidates_uses_env_file() {
+            let _guard = env_guard();
+            let previous = env::var("NVJPEG_LIB").ok();
+            env::set_var("NVJPEG_LIB", r"C:\fake\nvjpeg64_12.dll");
+            let candidates = nvjpeg_library_candidates();
+            assert_eq!(
+                candidates,
+                vec![PathBuf::from(r"C:\fake\nvjpeg64_12.dll")]
+            );
+            restore_env(previous);
+        }
+
+        #[test]
+        fn nvjpeg_library_candidates_uses_env_dir() {
+            let _guard = env_guard();
+            let previous = env::var("NVJPEG_LIB").ok();
+            let dir = tempdir().unwrap();
+            env::set_var("NVJPEG_LIB", dir.path());
+            let candidates = nvjpeg_library_candidates();
+            let expected: Vec<PathBuf> = NVJPEG_DLL_CANDIDATES
+                .iter()
+                .map(|name| dir.path().join(name))
+                .collect();
+            assert_eq!(candidates, expected);
+            restore_env(previous);
+        }
     }
 }
