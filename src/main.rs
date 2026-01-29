@@ -22,7 +22,7 @@ struct Cli {
     #[arg(long)]
     clear_cache: bool,
 
-    /// Convert png to webp, jpg, jpg_gpu, or jxl after deletions
+    /// Convert png to webp, jpg, or jxl after deletions
     #[arg(long, value_enum)]
     convert: Option<ConvertFormat>,
 }

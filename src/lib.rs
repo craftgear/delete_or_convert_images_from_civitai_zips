@@ -30,10 +30,6 @@ use zip::write::FileOptions;
 use zip::ZipArchive;
 use tempfile::Builder;
 
-mod ffi;
-mod gpu_jpeg;
-
-use crate::gpu_jpeg::convert_png_to_jpeg_gpu;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -88,8 +84,6 @@ pub enum ConvertFormat {
     Webp,
     #[value(alias = "jpg")]
     Jpeg,
-    #[value(name = "jpg_gpu")]
-    JpegGpu,
     Jxl,
 }
 
@@ -1367,7 +1361,6 @@ fn convert_extension(format: ConvertFormat) -> &'static str {
     match format {
         ConvertFormat::Webp => "webp",
         ConvertFormat::Jpeg => "jpg",
-        ConvertFormat::JpegGpu => "jpg",
         ConvertFormat::Jxl => "jxl",
     }
 }
@@ -1414,7 +1407,7 @@ fn convert_png_for_format(
 ) -> Result<ConversionOutcome, AppError> {
     match format {
         ConvertFormat::Jxl => convert_png_to_jxl(data, text_chunks, has_json),
-        ConvertFormat::Webp | ConvertFormat::Jpeg | ConvertFormat::JpegGpu => {
+        ConvertFormat::Webp | ConvertFormat::Jpeg => {
             let converted = convert_png_bytes_basic(data, format)?;
             if text_chunks.is_empty() {
                 return Ok(ConversionOutcome::Converted(converted));
@@ -1491,10 +1484,6 @@ fn convert_png_bytes_basic(data: &[u8], format: ConvertFormat) -> Result<Vec<u8>
                 rgb.height(),
                 ExtendedColorType::Rgb8,
             )?;
-        }
-        ConvertFormat::JpegGpu => {
-            let rgba = img.to_rgba8();
-            out = convert_png_to_jpeg_gpu(&rgba, 90)?;
         }
         ConvertFormat::Jxl => {
             return Err(AppError::Invalid("JXL is not supported here".to_string()));
@@ -1582,7 +1571,7 @@ fn embed_converted_metadata(
     let exif = build_exif_user_comment(chunks)?;
     match format {
         ConvertFormat::Webp => embed_webp_metadata(data, &exif, &xmp),
-        ConvertFormat::Jpeg | ConvertFormat::JpegGpu => embed_jpeg_metadata(data, &exif, &xmp),
+        ConvertFormat::Jpeg => embed_jpeg_metadata(data, &exif, &xmp),
         ConvertFormat::Jxl => Err(AppError::Invalid("JXL metadata is handled elsewhere".to_string())),
     }
 }
@@ -1809,7 +1798,6 @@ fn keyword_key(keywords: &[String], convert: Option<ConvertFormat>) -> String {
     let convert_key = match convert {
         Some(ConvertFormat::Webp) => "convert=webp",
         Some(ConvertFormat::Jpeg) => "convert=jpg",
-        Some(ConvertFormat::JpegGpu) => "convert=jpg_gpu",
         Some(ConvertFormat::Jxl) => "convert=jxl",
         None => "convert=none",
     };
@@ -2238,15 +2226,6 @@ mod tests {
         let jpg_bytes = read_zipfile_bytes(&mut jpg).unwrap();
         assert_ne!(jpg_bytes, vec![1, 2, 3, 4]);
         assert!(jpg_bytes.len() > 4);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn converts_png_to_jpg_gpu_on_windows() {
-        let png = make_png_with_text_chunks(&[("prompt", "cat")]);
-        let jpg = convert_png_bytes_basic(&png, ConvertFormat::JpegGpu).unwrap();
-        assert!(jpg.len() > 3);
-        assert!(jpg.as_slice().starts_with(&[0xFF, 0xD8, 0xFF]));
     }
 
     #[test]
@@ -2906,8 +2885,8 @@ mod tests {
     }
 
     #[test]
-    fn convert_extension_uses_jpg_for_gpu() {
-        assert_eq!(convert_extension(ConvertFormat::JpegGpu), "jpg");
+    fn convert_extension_uses_jpg() {
+        assert_eq!(convert_extension(ConvertFormat::Jpeg), "jpg");
     }
 
     #[test]
@@ -2959,10 +2938,10 @@ mod tests {
     }
 
     #[test]
-    fn keyword_key_uses_jpg_gpu() {
+    fn keyword_key_uses_jpg() {
         let keywords = vec!["cat".to_string()];
-        let key = keyword_key(&keywords, Some(ConvertFormat::JpegGpu));
-        assert!(key.contains("convert=jpg_gpu"));
+        let key = keyword_key(&keywords, Some(ConvertFormat::Jpeg));
+        assert!(key.contains("convert=jpg"));
     }
 
     #[cfg(windows)]

@@ -35,7 +35,7 @@ delete_images_from_zips /path/to/zips --keywords "cat,dog"
 - `--keywords` Comma separated keywords used for matching
 - `--progress` Show progress to stderr, default is true
 - `--clear-cache` Delete cache file and exit
-- `--convert` Convert png to `webp`, `jpg`, `jpg_gpu`, or `jxl` after deletions
+- `--convert` Convert png to `webp`, `jpg`, or `jxl` after deletions
 
 ## Behavior
 - For each ZIP file, prompts are read from JSON first. If a JSON entry has no prompt, the tool checks the corresponding image metadata.
@@ -52,13 +52,6 @@ Cache file location:
 
 ## Environment variables
 - `BUF_MB` Set write buffer size in MB, default is 16
-- `NVJPEG_LIB` (Linux, Windows) Path to `libnvjpeg.so` or `nvjpeg64_*.dll`, or a directory that contains it
-
-## GPU encoding
-- `jpg_gpu` requires hardware acceleration
-- Linux uses nvJPEG and errors if `libnvjpeg.so` is not available or GPU is unavailable
-- macOS uses VideoToolbox and errors if hardware encode is unavailable
-- Windows uses nvJPEG and falls back to CPU if the library or GPU is unavailable
 
 ## Examples
 ```bash
@@ -80,8 +73,6 @@ delete_images_from_zips ./data --keywords cat --convert jpg
 # convert png to jxl
 delete_images_from_zips ./data --keywords cat --convert jxl
 
-# convert png to jpg using GPU
-delete_images_from_zips ./data --keywords cat --convert jpg_gpu
 ```
 
 ## Development
