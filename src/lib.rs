@@ -1926,7 +1926,9 @@ fn cache_file_path() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .or_else(|| env::var_os("HOME").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join(".cache").join("delete_images_from_zips").join("processed.json")
+    base.join(".cache")
+        .join("delete_or_convert_images_from_civitai_zips")
+        .join("processed.json")
 }
 
 fn load_cache(path: &std::path::Path) -> CacheMap {
@@ -2968,7 +2970,7 @@ mod tests {
 
         let cache = dir
             .path()
-            .join(".cache/delete_images_from_zips/processed.json");
+            .join(".cache/delete_or_convert_images_from_civitai_zips/processed.json");
         fs::create_dir_all(cache.parent().unwrap()).unwrap();
         fs::write(&cache, "{}").unwrap();
 

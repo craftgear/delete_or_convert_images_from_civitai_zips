@@ -1,6 +1,6 @@
-# delete_images_from_civitai_zips
+# delete_or_convert_images_from_civitai_zips
 
-CLI tool that scans ZIP files under a directory and deletes image and JSON entries when their prompt matches given keywords. It preserves timestamps and avoids recompression by copying raw ZIP entries.
+CLI tool that scans ZIP files under a directory and deletes image and JSON entries when their prompt matches given keywords. It preserves timestamps and avoids recompression by copying raw ZIP entries. If no keywords are provided, deletions are skipped and only conversions run.
 
 ## Features
 - Recursively scans for `.zip` files
@@ -15,7 +15,7 @@ CLI tool that scans ZIP files under a directory and deletes image and JSON entri
 
 ## Install 
 
-Windows binary can be downloaded from the [ GitHub Releases page ](https://github.com/craftgear/delete_images_from_civitai_zips/releases).
+Windows binary can be downloaded from the [ GitHub Releases page ](https://github.com/craftgear/delete_or_convert_images_from_civitai_zips/releases).
 
 ## Build
 ```bash
@@ -24,15 +24,15 @@ cargo build --release
 
 ## Usage
 ```bash
-delete_images_from_zips /path/to/zips --keywords "cat,dog"
+delete_or_convert_images_from_civitai_zips /path/to/zips --keywords "cat,dog"
 ```
 
 ### Maintenance
-- Clear cache: `delete_images_from_zips --clear-cache`
+- Clear cache: `delete_or_convert_images_from_civitai_zips --clear-cache`
 
 ### Options
 - `DIR` Path to scan for ZIP files
-- `--keywords` Comma separated keywords used for matching
+- `--keywords` Comma separated keywords used for matching (optional)
 - `--progress` Show progress to stderr, default is true
 - `--clear-cache` Delete cache file and exit
 - `--convert` Convert png to `webp`, `jpg`, or `jxl` after deletions
@@ -48,7 +48,7 @@ delete_images_from_zips /path/to/zips --keywords "cat,dog"
 ## Cache
 Processed ZIPs are cached by keyword set using a hash of path, size, and mtime.  
 Cache file location:
-`~/.cache/delete_images_from_zips/processed.json`
+`~/.cache/delete_or_convert_images_from_civitai_zips/processed.json`
 
 ## Environment variables
 - `BUF_MB` Set write buffer size in MB, default is 16
@@ -56,22 +56,25 @@ Cache file location:
 ## Examples
 ```bash
 # delete entries matching either "cat" or "dog"
-delete_images_from_zips ./data --keywords cat,dog
+delete_or_convert_images_from_civitai_zips ./data --keywords cat,dog
 
 # disable progress output
-delete_images_from_zips ./data --keywords cat --progress false
+delete_or_convert_images_from_civitai_zips ./data --keywords cat --progress false
 
 # clear cache only
-delete_images_from_zips --clear-cache
+delete_or_convert_images_from_civitai_zips --clear-cache
 
 # convert png to webp
-delete_images_from_zips ./data --keywords cat --convert webp
+delete_or_convert_images_from_civitai_zips ./data --keywords cat --convert webp
+
+# convert png to webp without deletions
+delete_or_convert_images_from_civitai_zips ./data --convert webp
 
 # convert png to jpg
-delete_images_from_zips ./data --keywords cat --convert jpg
+delete_or_convert_images_from_civitai_zips ./data --keywords cat --convert jpg
 
 # convert png to jxl
-delete_images_from_zips ./data --keywords cat --convert jxl
+delete_or_convert_images_from_civitai_zips ./data --keywords cat --convert jxl
 
 ```
 

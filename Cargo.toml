@@ -1,5 +1,5 @@
 [package]
-name = "delete_images_from_zips"
+name = "delete_or_convert_images_from_civitai_zips"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
