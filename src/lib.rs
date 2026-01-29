@@ -145,7 +145,7 @@ pub fn run(
     progress: bool,
     convert: Option<ConvertFormat>,
 ) -> Result<(), AppError> {
-    init_rayon_threads(4)?;
+    init_rayon_threads(conversion_parallel_threads(convert))?;
     let keywords = parse_keywords(keywords_csv);
     let keyword_key = keyword_key(&keywords, convert);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -2023,6 +2023,19 @@ fn init_rayon_threads(threads: usize) -> Result<(), AppError> {
     }
 }
 
+fn conversion_parallel_threads(convert: Option<ConvertFormat>) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    if matches!(convert, Some(ConvertFormat::Jxl)) {
+        // WHY: JXL側で内部並列を使うためレイオンは固定値で抑える
+        4
+    } else {
+        // WHY: WebP/JPEGのエンコードは内部並列がないためCPUコア数を使う
+        cores
+    }
+}
+
 fn path_len_warning(path: &Path) -> Option<String> {
     let _ = path;
     // WHY: パス長警告は出さない方針に変更した
@@ -2327,6 +2340,22 @@ mod tests {
             .unwrap_or(1);
         let expected = if cores / 2 == 0 { 1 } else { cores / 2 };
         assert_eq!(jxl_parallel_threads(), expected);
+    }
+
+    #[test]
+    fn conversion_parallel_threads_uses_available_for_webp() {
+        let cores = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        assert_eq!(
+            conversion_parallel_threads(Some(ConvertFormat::Webp)),
+            cores
+        );
+    }
+
+    #[test]
+    fn conversion_parallel_threads_uses_fixed_for_jxl() {
+        assert_eq!(conversion_parallel_threads(Some(ConvertFormat::Jxl)), 4);
     }
 
     #[test]
