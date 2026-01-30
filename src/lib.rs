@@ -814,6 +814,11 @@ fn prepare_conversions_from_memory(
     bar: Option<&ProgressBar>,
     progress_info: &ProgressInfo,
 ) -> Result<PreparedConversions, AppError> {
+    if let Some(b) = bar {
+        // WHY: 巨大zipの全読み込みに時間がかかるため、停止に見えないよう先に状態を表示する
+        b.set_message(color_msg("loading zip", "36"));
+        b.tick();
+    }
     let zip_bytes = io_ctx(path, fs::read(&io_path(path)))?;
     let zip_bytes = Arc::new(zip_bytes);
     if let Some(b) = bar {
